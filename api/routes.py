@@ -8140,6 +8140,12 @@ def _session_model_state_from_request(
         else None
     )
     if model_value:
+        # Restored picker options may carry an opaque endpoint ID separately
+        # from its owner. Preserve that explicit named endpoint before parsing
+        # any route-looking text inside the model ID.
+        from api.config import _is_named_endpoint_provider, model_with_provider_context
+        if provider and _is_named_endpoint_provider(provider):
+            model_value = model_with_provider_context(model_value, provider)
         _bare, explicit_provider = _split_provider_qualified_model(model_value)
         if explicit_provider:
             provider = explicit_provider
@@ -21573,6 +21579,11 @@ def _handle_live_models(handler, parsed):
         from api.config import _resolve_provider_alias
         provider = _resolve_provider_alias(provider)
 
+        # Reject ambiguous configured identities before returning a cached
+        # catalog or entering any provider-discovery fallback.
+        from api.config import _configured_provider_key
+        _configured_provider_key(provider)
+
         cache_key = _live_models_cache_key(provider)
         cached = _get_cached_live_models(cache_key)
         if cached is not None:
@@ -21862,6 +21873,9 @@ def _handle_live_models(handler, parsed):
             if annotate_fast_tier:
                 entry["supports_fast_tier"] = _model_supports_fast_tier_for_provider(mid, provider)
             models_out.append(entry)
+        from api.config import _apply_provider_prefix, _is_named_endpoint_provider
+        if _is_named_endpoint_provider(provider):
+            models_out = _apply_provider_prefix(models_out, provider, None)
         return _finish({"provider": provider, "models": models_out,
                         "count": len(models_out)})
 

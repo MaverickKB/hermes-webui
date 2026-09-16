@@ -120,6 +120,10 @@ returns no models or another provider delays the initial catalog rebuild.
 `discover_models: false` keeps discovery disabled.
 Discovery uses that entry's inline `api_key`, `key_env`,
 or `api_key_env` in the selected profile. Keyless endpoints need no credential.
+Named provider keys must be unique after case and underscore normalization:
+`local_router` and `local-router` conflict. Give each endpoint a distinct key
+before selecting its models. An ambiguous group is omitted from the picker;
+direct selection or live refresh reports which provider keys need renaming.
 
 Advanced provider flows such as Nous Portal and GitHub Copilot are still
 terminal-first. OpenAI Codex and Anthropic Claude Code OAuth can be started in

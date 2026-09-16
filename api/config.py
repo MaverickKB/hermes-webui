@@ -2376,22 +2376,39 @@ def _apply_provider_prefix(
 ) -> list[dict]:
     """Return *raw_models* with @provider: prefixes applied when needed.
 
-    Prefixing is skipped when (a) the provider is already the active one, or
-    (b) a model id already starts with '@' or contains '/' (already routable).
+    Named configured endpoints always retain their provider identity, including
+    models containing slashes or leading @ characters. Their IDs are opaque
+    endpoint values. Built-in providers retain their existing conventions.
     """
+    named_endpoint = _is_named_endpoint_provider(provider_id)
     _active = (active_provider or "").lower()
-    if not _active or provider_id == _active:
+    if not named_endpoint and (not _active or provider_id == _active):
         return list(raw_models)
     result = []
     for m in raw_models:
         mid = m["id"]
         entry = dict(m)
-        if mid.startswith("@") or "/" in mid:
+        if not named_endpoint and (mid.startswith("@") or "/" in mid):
             result.append(entry)
         else:
             entry["id"] = f"@{provider_id}:{mid}"
             result.append(entry)
     return result
+
+
+def _default_model_picker_id(model_id: str, provider_id: str | None) -> str | None:
+    """Keep configured defaults subject to the catalog's endpoint ownership."""
+    if not model_id:
+        return None
+    try:
+        if not _is_named_endpoint_provider(provider_id):
+            return model_id
+        return _apply_provider_prefix(
+            [{"id": model_id}], _canonicalise_provider_id(provider_id) or "default", provider_id
+        )[0]["id"]
+    except AmbiguousCustomProviderError as exc:
+        logger.warning("Omitting ambiguous provider default from model catalog: %s", exc)
+        return None
 
 
 def _deduplicate_model_ids(groups: list[dict]) -> None:
@@ -2424,6 +2441,18 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
     """
     if not groups:
         return
+
+    # Default injection and ordinary groups share the same identity boundary.
+    # Ambiguous configured names cannot become selectable through either path.
+    valid_groups = []
+    for group in groups:
+        try:
+            _configured_provider_key(group.get("provider_id"))
+        except AmbiguousCustomProviderError as exc:
+            logger.warning("Omitting ambiguous provider from model catalog: %s", exc)
+            continue
+        valid_groups.append(group)
+    groups[:] = valid_groups
 
     # Collect {model_id: [(group_idx, bucket_name, model_idx), ...]} in
     # alphabetical provider_id order so that the "first occurrence stays
@@ -2705,19 +2734,36 @@ def _get_providers_cfg() -> dict:
 def _configured_provider_key(provider_id):
     """Recover the config-owned key from a canonical model-picker identity."""
     providers = _get_providers_cfg()
-    if provider_id in providers:
-        return provider_id
     canonical = _canonicalise_provider_id(provider_id)
     matches = [
         key for key, entry in providers.items()
         if isinstance(entry, dict) and _canonicalise_provider_id(key) == canonical
     ]
+    if len(matches) > 1 and canonical not in _PROVIDER_MODELS and canonical not in _PROVIDER_DISPLAY:
+        raise AmbiguousCustomProviderError(
+            f"Configured providers {sorted(matches)!r} normalize to the same "
+            f"provider identity {canonical!r}. Rename one so each endpoint "
+            "has a unique provider identity."
+        )
+    if provider_id in providers:
+        return provider_id
     return matches[0] if len(matches) == 1 else provider_id
 
 
 def _get_provider_cfg(provider_id) -> dict:
     provider_cfg = _get_providers_cfg().get(_configured_provider_key(provider_id), {})
     return provider_cfg if isinstance(provider_cfg, dict) else {}
+
+
+def _is_named_endpoint_provider(provider_id) -> bool:
+    """Whether a unique configured endpoint owns this picker identity."""
+    canonical = _canonicalise_provider_id(provider_id)
+    return (
+        not canonical.startswith("custom:")
+        and canonical not in _PROVIDER_MODELS
+        and canonical not in _PROVIDER_DISPLAY
+        and bool(_get_provider_cfg(provider_id).get("base_url"))
+    )
 
 
 class AmbiguousCustomProviderError(ValueError):
@@ -3038,7 +3084,7 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
                 continue
             if target in _configured_model_ids(pdef.get('models')):
                 p_base_url = str(pdef.get('base_url') or '').strip()
-                return model_id, slug, p_base_url or None
+                return _finalize(model_id, slug, p_base_url or None)
 
     # @provider:model format — explicit provider hint from the dropdown.
     # Route through that provider directly (resolve_runtime_provider will
@@ -4808,7 +4854,19 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     """
     model = str(model_id or "").strip()
     provider = str(model_provider or "").strip().lower()
-    if not model or not provider or provider == "default" or model.startswith("@"):
+    if not model or not provider or provider == "default":
+        return model
+
+    provider_key = _configured_provider_key(provider)
+    if _is_named_endpoint_provider(provider):
+        provider = _canonicalise_provider_id(provider)
+        # Picker-produced routes persist with their outer owner intact. Raw
+        # restored endpoint IDs resembling another route still belong here.
+        outer_provider = model[1:].split(":", 1)[0] if model.startswith("@") and ":" in model else None
+        if outer_provider and _canonicalise_provider_id(outer_provider) == provider:
+            return model
+        return f"@{provider}:{model}"
+    if model.startswith("@"):
         return model
 
     model_cfg = cfg.get("model", {})
@@ -4847,7 +4905,7 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     # 'unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL' inherits the default provider
     # (e.g. openai-codex) and is sent to the wrong backend.
     providers_cfg = cfg.get("providers") if isinstance(cfg, dict) else {}
-    if isinstance(providers_cfg, dict) and provider in providers_cfg:
+    if isinstance(providers_cfg, dict) and provider_key in providers_cfg:
         return f"@{provider}:{model}"
 
     # (Plugin-only provider routing handled above, before the config_provider
@@ -7015,7 +7073,8 @@ def _minimal_static_models_catalog() -> dict:
                 pass
         default_model = get_effective_default_model(cfg)
         groups: list[dict] = []
-        if default_model:
+        default_picker_id = _default_model_picker_id(default_model, active_provider)
+        if default_picker_id:
             try:
                 label = _get_label_for_model(default_model, [])
             except Exception:
@@ -7024,9 +7083,11 @@ def _minimal_static_models_catalog() -> dict:
                 {
                     "provider": "Default",
                     "provider_id": active_provider or "default",
-                    "models": [{"id": default_model, "label": label}],
+                    "models": [{"id": default_picker_id, "label": label}],
                 }
             )
+        if active_provider not in _PROVIDER_MODELS and active_provider not in _PROVIDER_DISPLAY:
+            _deduplicate_model_ids(groups)
         return _annotate_fast_tier_model_groups({
             "active_provider": active_provider,
             "default_model": default_model,
@@ -7273,7 +7334,11 @@ def _static_models_catalog_without_live_probes() -> dict:
 
             provider_name = _PROVIDER_DISPLAY.get(pid, pid.replace("-", " ").title())
             raw_key = canonical_to_raw_provider_key.get(pid, pid)
-            provider_cfg = _get_provider_cfg(raw_key)
+            try:
+                provider_cfg = _get_provider_cfg(raw_key)
+            except AmbiguousCustomProviderError as exc:
+                logger.warning("Omitting ambiguous provider from model catalog: %s", exc)
+                continue
             raw_models = []
             if (
                 isinstance(provider_cfg, dict)
@@ -7317,26 +7382,27 @@ def _static_models_catalog_without_live_probes() -> dict:
                     }
                 )
 
-        if default_model:
+        default_picker_id = _default_model_picker_id(default_model, active_provider)
+        if default_picker_id:
             all_model_ids = {
                 str(model.get("id") or "")
                 for group in groups
                 for model in group.get("models", [])
             }
-            if default_model not in all_model_ids and f"@{active_provider}:{default_model}" not in all_model_ids:
+            if default_picker_id not in all_model_ids and f"@{active_provider}:{default_model}" not in all_model_ids:
                 label = _get_label_for_model(default_model, groups)
                 target_group = next(
                     (group for group in groups if group.get("provider_id") == active_provider),
                     None,
                 )
                 if target_group is not None:
-                    target_group.setdefault("models", []).insert(0, {"id": default_model, "label": label})
+                    target_group.setdefault("models", []).insert(0, {"id": default_picker_id, "label": label})
                 elif groups:
                     groups.append(
                         {
                             "provider": "Default",
                             "provider_id": active_provider or "default",
-                            "models": [{"id": default_model, "label": label}],
+                            "models": [{"id": default_picker_id, "label": label}],
                         }
                     )
 
@@ -7583,7 +7649,7 @@ def _current_webui_version() -> str | None:
 # WebUI version string (or a debug build doesn't have a version), a structural
 # change still invalidates the cache.
 # Earlier catalogs omitted named-provider defaults during bounded rebuilds.
-_MODELS_CACHE_SCHEMA_VERSION = 4
+_MODELS_CACHE_SCHEMA_VERSION = 5
 
 
 _models_cache_path = STATE_DIR / "models_cache.json"
@@ -8422,6 +8488,7 @@ def _read_custom_endpoint_models(
     api_key: object = "",
     trusted_base_urls: tuple[object, ...] = (),
 ) -> tuple[list[dict], dict | None]:
+    _configured_provider_key(provider)
     base = str(base_url or "").strip()
     if not base:
         return [], None
@@ -9236,12 +9303,16 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     for _cp in _custom_providers_for_trust
                     if isinstance(_cp, dict) and _cp.get("base_url")
                 )
-            _active_endpoint_models, _active_endpoint_error = _read_custom_endpoint_models(
-                base_url,
-                provider,
-                api_key=api_key,
-                trusted_base_urls=tuple(_trusted_custom_bases),
-            )
+            try:
+                _active_endpoint_models, _active_endpoint_error = _read_custom_endpoint_models(
+                    base_url,
+                    provider,
+                    api_key=api_key,
+                    trusted_base_urls=tuple(_trusted_custom_bases),
+                )
+            except AmbiguousCustomProviderError as exc:
+                logger.warning("Omitting ambiguous active endpoint from model catalog: %s", exc)
+                _active_endpoint_models = []
             for auto_model in _active_endpoint_models:
                 auto_detected_models.append(auto_model)
                 provider_key = provider.lower()
@@ -9799,7 +9870,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     # (#2245).  Fall back to the canonical pid for providers
                     # that appear in _PROVIDER_MODELS but not in cfg.
                     _raw_key = _canonical_to_raw_provider_key.get(pid, pid)
-                    provider_cfg = _get_provider_cfg(_raw_key)
+                    try:
+                        provider_cfg = _get_provider_cfg(_raw_key)
+                    except AmbiguousCustomProviderError as exc:
+                        logger.warning("Omitting ambiguous provider from model catalog: %s", exc)
+                        continue
                     raw_models = []
 
                     # User-configured model allowlists are explicit local
@@ -9924,7 +9999,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     {"provider": "Default", "provider_id": "default", "models": [{"id": default_model, "label": label}]}
                 )
 
-        if default_model:
+        default_picker_id = _default_model_picker_id(default_model, active_provider)
+        if default_picker_id:
             # Guard against provider-id values mistakenly stored in
             # ``model.default``. The injection logic below puts ANY string
             # into the picker as a fake option, so a stray provider id
@@ -9951,7 +10027,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     for bucket_name in ("models", "extra_models")
                     for m in g.get(bucket_name, [])
                 }
-                if _norm_model_id(default_model) not in all_ids_norm:
+                if _norm_model_id(default_picker_id) not in all_ids_norm:
                     label = _get_label_for_model(default_model, groups)
                     target_display = (
                         _PROVIDER_DISPLAY.get(active_provider, active_provider or "").lower()
@@ -9961,7 +10037,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     injected = False
                     for g in groups:
                         if target_display and g.get("provider", "").lower() == target_display:
-                            g["models"].insert(0, {"id": default_model, "label": label})
+                            g["models"].insert(0, {"id": default_picker_id, "label": label})
                             injected = True
                             break
                     if not injected and groups:
@@ -9969,7 +10045,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             {
                                 "provider": "Default",
                                 "provider_id": active_provider or "default",
-                                "models": [{"id": default_model, "label": label}],
+                                "models": [{"id": default_picker_id, "label": label}],
                             }
                         )
 
