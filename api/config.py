@@ -2702,8 +2702,21 @@ def _get_providers_cfg() -> dict:
     return providers_cfg if isinstance(providers_cfg, dict) else {}
 
 
+def _configured_provider_key(provider_id):
+    """Recover the config-owned key from a canonical model-picker identity."""
+    providers = _get_providers_cfg()
+    if provider_id in providers:
+        return provider_id
+    canonical = _canonicalise_provider_id(provider_id)
+    matches = [
+        key for key, entry in providers.items()
+        if isinstance(entry, dict) and _canonicalise_provider_id(key) == canonical
+    ]
+    return matches[0] if len(matches) == 1 else provider_id
+
+
 def _get_provider_cfg(provider_id) -> dict:
-    provider_cfg = _get_providers_cfg().get(provider_id, {})
+    provider_cfg = _get_providers_cfg().get(_configured_provider_key(provider_id), {})
     return provider_cfg if isinstance(provider_cfg, dict) else {}
 
 
@@ -2858,6 +2871,10 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
                 cfg.get('custom_providers', []),
                 _custom_provider_slug_key(provider),
             )
+        # Picker IDs fold underscores and case, while Hermes named-provider
+        # credentials are owned by the original config key.
+        if provider not in _PROVIDER_MODELS and provider not in _PROVIDER_DISPLAY:
+            provider = _configured_provider_key(provider)
         return model, provider, base_url
 
     model_id = (model_id or "").strip()
@@ -7125,10 +7142,18 @@ def _static_models_catalog_without_live_probes() -> dict:
                         str(provider_cfg.get(key) or "").strip()
                         for key in ("api_key", "key_env", "base_url")
                     )
-                    provider_models = provider_cfg.get("models")
-                    for model_id in _configured_model_ids(provider_models):
+                    provider_models = _configured_model_ids(provider_cfg.get("models"))
+                    for model_id in provider_models:
                         _append_model_id(canonical, model_id)
                         has_local_signal = True
+                    if (
+                        not provider_models
+                        and not is_known_provider
+                        and provider_cfg.get("enabled") is not False
+                    ):
+                        # A slow unrelated catalog must not hide a configured
+                        # endpoint while its live discovery finishes.
+                        _append_model_id(canonical, provider_cfg.get("default_model"))
                     if has_local_signal:
                         detected_providers.add(canonical)
 
@@ -7557,7 +7582,8 @@ def _current_webui_version() -> str | None:
 # guarantees that even if a future release accidentally reuses the same
 # WebUI version string (or a debug build doesn't have a version), a structural
 # change still invalidates the cache.
-_MODELS_CACHE_SCHEMA_VERSION = 3
+# Earlier catalogs omitted named-provider defaults during bounded rebuilds.
+_MODELS_CACHE_SCHEMA_VERSION = 4
 
 
 _models_cache_path = STATE_DIR / "models_cache.json"
@@ -8327,8 +8353,139 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
     )
 
 
+def _models_endpoint_for_base_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
+
+def _extract_model_entries_from_payload(data: object, provider: str) -> list[dict]:
+    models_list = []
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], list):
+            models_list = data["data"]
+        elif "models" in data and isinstance(data["models"], list):
+            models_list = data["models"]
+    models = []
+    seen = set()
+    for model in models_list:
+        if not isinstance(model, dict):
+            continue
+        model_id = (
+            model.get("id", "")
+            or model.get("name", "")
+            or model.get("model", "")
+        )
+        model_name = model.get("name", "") or model.get("model", "") or model_id
+        model_id = str(model_id or "").strip()
+        model_name = str(model_name or "").strip()
+        if not model_id or not model_name or model_id in seen:
+            continue
+        seen.add(model_id)
+        label = _format_ollama_label(model_id) if provider in ("ollama", "ollama-cloud") else model_name
+        models.append({"id": model_id, "label": label})
+    return models
+
+
+def _custom_endpoint_error(
+    provider: str,
+    exc: Exception,
+    *,
+    code: int | None = None,
+) -> dict:
+    provider_label = str(provider or "custom").replace("custom:", "")
+    status_code = code if code is not None else getattr(exc, "code", None)
+    if status_code in (401, 403):
+        return {
+            "kind": "auth",
+            "code": int(status_code),
+            "message": f"Models endpoint returned {status_code}; check the API key for {provider_label}.",
+        }
+    if isinstance(status_code, int):
+        return {
+            "kind": "http",
+            "code": int(status_code),
+            "message": f"Models endpoint returned {status_code} for {provider_label}; see logs.",
+        }
+    return {
+        "kind": "network",
+        "code": None,
+        "message": f"Models endpoint unreachable for {provider_label}; verify base_url.",
+    }
+
+
+def _read_custom_endpoint_models(
+    base_url: object,
+    provider: str,
+    *,
+    api_key: object = "",
+    trusted_base_urls: tuple[object, ...] = (),
+) -> tuple[list[dict], dict | None]:
+    base = str(base_url or "").strip()
+    if not base:
+        return [], None
+    try:
+        import ipaddress
+        import urllib.error
+        import urllib.request
+        import socket
+
+        endpoint_url = _models_endpoint_for_base_url(base)
+        headers = {}
+        key = str(api_key or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        # User-configured custom provider endpoints are explicitly trusted,
+        # but keep the same private-IP guard for non-matching targets used by
+        # the legacy active model.base_url path.
+        _ssrf_trusted_hosts: set[str] = set()
+        for trusted in (base, *trusted_base_urls):
+            _cp_parsed = urlparse(
+                str(trusted) if "://" in str(trusted) else f"http://{trusted}"
+            )
+            if _cp_parsed.hostname:
+                _ssrf_trusted_hosts.add(_cp_parsed.hostname.lower())
+
+        parsed_url = urlparse(endpoint_url if "://" in endpoint_url else f"http://{endpoint_url}")
+        if parsed_url.scheme not in ("", "http", "https"):
+            raise ValueError(f"Invalid URL scheme: {parsed_url.scheme}")
+        if parsed_url.hostname:
+            try:
+                resolved_ips = socket.getaddrinfo(parsed_url.hostname, None)
+                for _, _, _, _, addr in resolved_ips:
+                    addr_obj = ipaddress.ip_address(addr[0])
+                    if addr_obj.is_private or addr_obj.is_loopback or addr_obj.is_link_local:
+                        host_l = (parsed_url.hostname or "").lower()
+                        is_known_local = any(
+                            k in host_l
+                            for k in ("ollama", "localhost", "127.0.0.1", "lmstudio", "lm-studio")
+                        ) or host_l in _ssrf_trusted_hosts
+                        if not is_known_local:
+                            raise ValueError(f"SSRF: resolved hostname to private IP {addr[0]}")
+            except socket.gaierror:
+                pass
+
+        req = urllib.request.Request(endpoint_url, method="GET")
+        req.add_header("User-Agent", "OpenAI/Python 1.0")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:  # nosec B310
+            data = json.loads(response.read().decode("utf-8"))
+        return _extract_model_entries_from_payload(data, provider), None
+    except urllib.error.HTTPError as exc:
+        error = _custom_endpoint_error(provider, exc, code=getattr(exc, "code", None))
+        logger.debug("Custom endpoint models fetch failed for provider %s: %s", provider, error)
+        return [], error
+    except Exception as exc:
+        error = _custom_endpoint_error(provider, exc)
+        logger.debug("Custom endpoint unreachable or misconfigured for provider %s: %s", provider, error)
+        return [], error
+
+
 def _read_live_provider_model_ids(provider_id: str) -> list[str]:
-    """Return live model IDs from Hermes CLI for a provider, or [] on failure.
+    """Return configured endpoint models or the Hermes CLI provider catalog.
 
     WebUI's static ``_PROVIDER_MODELS`` table is only a fallback.  The agent CLI
     owns the provider registry and catalog-discovery logic, so ordinary picker
@@ -8340,6 +8497,34 @@ def _read_live_provider_model_ids(provider_id: str) -> list[str]:
     pid = str(provider_id or "").strip()
     if not pid:
         return []
+
+    # Named providers are profile-owned routes, absent from Hermes' built-in
+    # catalog registry. Use the same endpoint probe as custom_providers, with
+    # only this entry's credentials. Never borrow the active provider's key.
+    provider_cfg = _get_provider_cfg(pid)
+    if provider_cfg and pid not in _PROVIDER_MODELS and pid not in _PROVIDER_DISPLAY:
+        if provider_cfg.get("enabled") is False:
+            return []
+        base_url = str(provider_cfg.get("base_url") or "").strip()
+        if base_url:
+            configured = _configured_model_ids(provider_cfg.get("models"))
+            fallback = str(provider_cfg.get("default_model") or "").strip()
+            fallback_ids = configured or ([fallback] if fallback else [])
+            if not _provider_discover_allowed(provider_cfg):
+                return fallback_ids
+            if configured and not _provider_models_are_discovered_catalog(provider_cfg):
+                return configured
+            key_env = str(provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or "").strip()
+            api_key = _thread_local_env_value(key_env).strip() if key_env else ""
+            if not api_key:
+                api_key = str(provider_cfg.get("api_key") or "").strip()
+                if api_key.startswith("${") and api_key.endswith("}"):
+                    api_key = _thread_local_env_value(api_key[2:-1]).strip()
+            models, _error = _read_custom_endpoint_models(base_url, pid, api_key=api_key)
+            if models:
+                return [model["id"] for model in models]
+            return fallback_ids
+
     try:
         from hermes_cli.models import provider_model_ids as _provider_model_ids
     except Exception:
@@ -8981,133 +9166,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     return "custom"
 
             return ""
-
-        def _models_endpoint_for_base_url(base_url: str) -> str:
-            base = str(base_url or "").strip().rstrip("/")
-            if base.endswith("/v1"):
-                return base + "/models"
-            return base + "/v1/models"
-
-        def _extract_model_entries_from_payload(data: object, provider: str) -> list[dict]:
-            models_list = []
-            if isinstance(data, dict):
-                if "data" in data and isinstance(data["data"], list):
-                    models_list = data["data"]
-                elif "models" in data and isinstance(data["models"], list):
-                    models_list = data["models"]
-            models = []
-            seen = set()
-            for model in models_list:
-                if not isinstance(model, dict):
-                    continue
-                model_id = (
-                    model.get("id", "")
-                    or model.get("name", "")
-                    or model.get("model", "")
-                )
-                model_name = model.get("name", "") or model.get("model", "") or model_id
-                model_id = str(model_id or "").strip()
-                model_name = str(model_name or "").strip()
-                if not model_id or not model_name or model_id in seen:
-                    continue
-                seen.add(model_id)
-                label = _format_ollama_label(model_id) if provider in ("ollama", "ollama-cloud") else model_name
-                models.append({"id": model_id, "label": label})
-            return models
-
-        def _custom_endpoint_error(
-            provider: str,
-            exc: Exception,
-            *,
-            code: int | None = None,
-        ) -> dict:
-            provider_label = str(provider or "custom").replace("custom:", "")
-            status_code = code if code is not None else getattr(exc, "code", None)
-            if status_code in (401, 403):
-                return {
-                    "kind": "auth",
-                    "code": int(status_code),
-                    "message": f"Models endpoint returned {status_code} — check the API key for {provider_label}.",
-                }
-            if isinstance(status_code, int):
-                return {
-                    "kind": "http",
-                    "code": int(status_code),
-                    "message": f"Models endpoint returned {status_code} for {provider_label}; see logs.",
-                }
-            return {
-                "kind": "network",
-                "code": None,
-                "message": f"Models endpoint unreachable for {provider_label}; verify base_url.",
-            }
-
-        def _read_custom_endpoint_models(
-            base_url: object,
-            provider: str,
-            *,
-            api_key: object = "",
-            trusted_base_urls: tuple[object, ...] = (),
-        ) -> tuple[list[dict], dict | None]:
-            base = str(base_url or "").strip()
-            if not base:
-                return [], None
-            try:
-                import ipaddress
-                import urllib.error
-                import urllib.request
-                import socket
-
-                endpoint_url = _models_endpoint_for_base_url(base)
-                headers = {}
-                key = str(api_key or "").strip()
-                if key:
-                    headers["Authorization"] = f"Bearer {key}"
-
-                # User-configured custom provider endpoints are explicitly trusted,
-                # but keep the same private-IP guard for non-matching targets used by
-                # the legacy active model.base_url path.
-                _ssrf_trusted_hosts: set[str] = set()
-                for trusted in (base, *trusted_base_urls):
-                    _cp_parsed = urlparse(
-                        str(trusted) if "://" in str(trusted) else f"http://{trusted}"
-                    )
-                    if _cp_parsed.hostname:
-                        _ssrf_trusted_hosts.add(_cp_parsed.hostname.lower())
-
-                parsed_url = urlparse(endpoint_url if "://" in endpoint_url else f"http://{endpoint_url}")
-                if parsed_url.scheme not in ("", "http", "https"):
-                    raise ValueError(f"Invalid URL scheme: {parsed_url.scheme}")
-                if parsed_url.hostname:
-                    try:
-                        resolved_ips = socket.getaddrinfo(parsed_url.hostname, None)
-                        for _, _, _, _, addr in resolved_ips:
-                            addr_obj = ipaddress.ip_address(addr[0])
-                            if addr_obj.is_private or addr_obj.is_loopback or addr_obj.is_link_local:
-                                host_l = (parsed_url.hostname or "").lower()
-                                is_known_local = any(
-                                    k in host_l
-                                    for k in ("ollama", "localhost", "127.0.0.1", "lmstudio", "lm-studio")
-                                ) or host_l in _ssrf_trusted_hosts
-                                if not is_known_local:
-                                    raise ValueError(f"SSRF: resolved hostname to private IP {addr[0]}")
-                    except socket.gaierror:
-                        pass
-
-                req = urllib.request.Request(endpoint_url, method="GET")
-                req.add_header("User-Agent", "OpenAI/Python 1.0")
-                for k, v in headers.items():
-                    req.add_header(k, v)
-                with urllib.request.urlopen(req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:  # nosec B310
-                    data = json.loads(response.read().decode("utf-8"))
-                return _extract_model_entries_from_payload(data, provider), None
-            except urllib.error.HTTPError as exc:
-                error = _custom_endpoint_error(provider, exc, code=getattr(exc, "code", None))
-                logger.debug("Custom endpoint models fetch failed for provider %s: %s", provider, error)
-                return [], error
-            except Exception as exc:
-                error = _custom_endpoint_error(provider, exc)
-                logger.debug("Custom endpoint unreachable or misconfigured for provider %s: %s", provider, error)
-                return [], error
 
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []

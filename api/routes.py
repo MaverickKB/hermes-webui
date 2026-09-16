@@ -21593,8 +21593,8 @@ def _handle_live_models(handler, parsed):
             _agent_dir = _os.path.normpath(_agent_dir)
             if _agent_dir not in _sys.path:
                 _sys.path.insert(0, _agent_dir)
-            from hermes_cli.models import provider_model_ids as _pmi
-            ids = _pmi(provider)
+            from api.config import _read_live_provider_model_ids
+            ids = _read_live_provider_model_ids(provider)
         except Exception as _import_err:
             logger.debug("provider_model_ids import failed for %s: %s", provider, _import_err)
             ids = []
